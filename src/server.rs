@@ -132,7 +132,6 @@ impl Server for AppServer {
             pty_writer: self.pty_writer.clone(),
             broadcast_tx: self.broadcast_tx.clone(),
             session_id: self.session_id.clone(),
-            user: None,
         }
     }
 }
@@ -143,7 +142,6 @@ struct ClientHandler {
     pty_writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     session_id: String,
-    user: Option<String>,
 }
 
 #[async_trait]
@@ -152,7 +150,6 @@ impl Handler for ClientHandler {
 
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
         if user == self.session_id {
-            self.user = Some(user.to_string());
             eprintln!("[romoto] auth accepted (none) for user={user} from {}", self.peer_addr);
             Ok(Auth::Accept)
         } else {
@@ -163,7 +160,6 @@ impl Handler for ClientHandler {
 
     async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
         if user == self.session_id {
-            self.user = Some(user.to_string());
             eprintln!("[romoto] auth accepted (password) for user={user} from {}", self.peer_addr);
             Ok(Auth::Accept)
         } else {
@@ -178,7 +174,6 @@ impl Handler for ClientHandler {
         _key: &russh::keys::key::PublicKey,
     ) -> Result<Auth, Self::Error> {
         if user == self.session_id {
-            self.user = Some(user.to_string());
             eprintln!("[romoto] auth accepted (publickey) for user={user} from {}", self.peer_addr);
             Ok(Auth::Accept)
         } else {
