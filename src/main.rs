@@ -9,6 +9,11 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--config") {
         config::run()
     } else {
-        server::run()
+        let cmd = args.iter()
+            .position(|a| a == "--cmd")
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.as_str())
+            .unwrap_or("claude");
+        server::run(cmd)
     }
 }

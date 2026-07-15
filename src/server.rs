@@ -15,12 +15,12 @@ struct SharedState {
     buffer: Vec<u8>,
 }
 
-pub fn run() -> Result<()> {
+pub fn run(cmd_name: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async())
+    rt.block_on(run_async(cmd_name))
 }
 
-async fn run_async() -> Result<()> {
+async fn run_async(cmd_name: &str) -> Result<()> {
     let session_id = generate_session_id();
     let cwd = std::env::current_dir()?;
 
@@ -32,7 +32,7 @@ async fn run_async() -> Result<()> {
         pixel_height: 0,
     })?;
 
-    let mut cmd = CommandBuilder::new("claude");
+    let mut cmd = CommandBuilder::new(cmd_name);
     cmd.cwd(&cwd);
 
     let _child = pty_pair.slave.spawn_command(cmd)?;
@@ -86,6 +86,7 @@ async fn run_async() -> Result<()> {
 
     let port = 2222;
     println!("\x1b[1mromoto\x1b[0m session started");
+    println!("Command: {cmd_name}");
     println!("Connect with: ssh {session_id}@localhost -p {port}");
     println!("Working directory: {}", cwd.display());
 
@@ -122,21 +123,27 @@ struct AppServer {
 impl Server for AppServer {
     type Handler = ClientHandler;
 
-    fn new_client(&mut self, _peer: Option<SocketAddr>) -> ClientHandler {
+    fn new_client(&mut self, peer: Option<SocketAddr>) -> ClientHandler {
+        let peer_addr = peer.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into());
+        eprintln!("[romoto] new connection from {peer_addr}");
         ClientHandler {
+            peer_addr,
             state: self.state.clone(),
             pty_writer: self.pty_writer.clone(),
             broadcast_tx: self.broadcast_tx.clone(),
             session_id: self.session_id.clone(),
+            user: None,
         }
     }
 }
 
 struct ClientHandler {
+    peer_addr: String,
     state: Arc<Mutex<SharedState>>,
     pty_writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     session_id: String,
+    user: Option<String>,
 }
 
 #[async_trait]
@@ -145,16 +152,22 @@ impl Handler for ClientHandler {
 
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
         if user == self.session_id {
+            self.user = Some(user.to_string());
+            eprintln!("[romoto] auth accepted (none) for user={user} from {}", self.peer_addr);
             Ok(Auth::Accept)
         } else {
+            eprintln!("[romoto] auth rejected (none) for user={user} from {}", self.peer_addr);
             Ok(Auth::Reject { proceed_with_methods: None })
         }
     }
 
     async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
         if user == self.session_id {
+            self.user = Some(user.to_string());
+            eprintln!("[romoto] auth accepted (password) for user={user} from {}", self.peer_addr);
             Ok(Auth::Accept)
         } else {
+            eprintln!("[romoto] auth rejected (password) for user={user} from {}", self.peer_addr);
             Ok(Auth::Reject { proceed_with_methods: None })
         }
     }
@@ -165,8 +178,11 @@ impl Handler for ClientHandler {
         _key: &russh::keys::key::PublicKey,
     ) -> Result<Auth, Self::Error> {
         if user == self.session_id {
+            self.user = Some(user.to_string());
+            eprintln!("[romoto] auth accepted (publickey) for user={user} from {}", self.peer_addr);
             Ok(Auth::Accept)
         } else {
+            eprintln!("[romoto] auth rejected (publickey) for user={user} from {}", self.peer_addr);
             Ok(Auth::Reject { proceed_with_methods: None })
         }
     }
@@ -220,12 +236,15 @@ impl Handler for ClientHandler {
         let mut rx = self.broadcast_tx.subscribe();
         let client_handle = handle.clone();
         let client_channel = channel;
+        let peer = self.peer_addr.clone();
+        eprintln!("[romoto] client joined session from {peer}");
         tokio::spawn(async move {
             while let Ok(data) = rx.recv().await {
                 if client_handle.data(client_channel, CryptoVec::from(data)).await.is_err() {
                     break;
                 }
             }
+            eprintln!("[romoto] client disconnected from {peer}");
         });
 
         session.channel_success(channel);
