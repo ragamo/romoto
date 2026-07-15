@@ -1,0 +1,7 @@
+services:
+  relay:
+    build: .
+    command: ["relay", "-p", "2222", "--pass", "${ROMOTO_PASS:-changeme}"]
+    ports:
+      - "2222:2222"
+    restart: unless-stopped
