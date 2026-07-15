@@ -1,3 +1,4 @@
+mod relay;
 mod server;
 
 use anyhow::Result;
@@ -14,14 +15,17 @@ fn main() -> Result<()> {
         println!("romoto - Share a terminal session over SSH");
         println!();
         println!("Usage: romoto <command> [options]");
+        println!("       romoto relay [options]");
         println!();
         println!("Arguments:");
-        println!("  <command>        Command to run (e.g. claude, opencode, codex)");
+        println!("  <command>          Command to run (e.g. claude, opencode, codex)");
+        println!("  relay              Run as a relay server");
         println!();
         println!("Options:");
-        println!("  -p, --port <n>   SSH port to listen on (default: 2222)");
-        println!("  -v, --version    Show version");
-        println!("  -h, --help       Show this help");
+        println!("  -p, --port <n>     SSH port to listen on (default: 2222)");
+        println!("  --relay <host>     Connect to a relay server");
+        println!("  -v, --version      Show version");
+        println!("  -h, --help         Show this help");
         return Ok(());
     }
 
@@ -31,14 +35,22 @@ fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2222);
 
+    let relay_pos = args.iter().position(|a| a == "--relay");
+    let relay_host = relay_pos.and_then(|i| args.get(i + 1)).map(|s| s.as_str());
+
     let cmd = args.iter()
         .enumerate()
         .skip(1)
         .find(|(i, a)| {
             !a.starts_with('-')
                 && port_pos.map_or(true, |p| *i != p + 1)
+                && relay_pos.map_or(true, |r| *i != r + 1)
         })
         .map(|(_, s)| s.as_str());
+
+    if cmd == Some("relay") {
+        return relay::run(port);
+    }
 
     let Some(cmd) = cmd else {
         eprintln!("Error: command is required");
@@ -47,5 +59,5 @@ fn main() -> Result<()> {
         std::process::exit(1);
     };
 
-    server::run(cmd, port)
+    server::run(cmd, port, relay_host)
 }

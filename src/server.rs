@@ -17,9 +17,9 @@ struct SharedState {
     last_size: PtySize,
 }
 
-pub fn run(cmd_name: &str, port: u16) -> Result<()> {
+pub fn run(cmd_name: &str, port: u16, relay_host: Option<&str>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(cmd_name, port))
+    rt.block_on(run_async(cmd_name, port, relay_host))
 }
 
 fn spawn_pty(cmd_name: &str, cwd: &std::path::Path) -> Result<(Box<dyn portable_pty::MasterPty + Send>, Box<dyn Write + Send>, Box<dyn Read + Send>)> {
@@ -43,7 +43,7 @@ fn spawn_pty(cmd_name: &str, cwd: &std::path::Path) -> Result<(Box<dyn portable_
     Ok((pty_pair.master, writer, reader))
 }
 
-async fn run_async(cmd_name: &str, port: u16) -> Result<()> {
+async fn run_async(cmd_name: &str, port: u16, relay_host: Option<&str>) -> Result<()> {
     let session_id = generate_session_id();
     let cwd = std::env::current_dir()?;
 
@@ -112,8 +112,30 @@ async fn run_async(cmd_name: &str, port: u16) -> Result<()> {
 
     println!("\x1b[1mromoto\x1b[0m session started");
     println!("Command: {cmd_name}");
-    println!("Connect with: ssh {session_id}@localhost -p {port}");
+    if let Some(relay) = relay_host {
+        println!("Relay: {relay}");
+        println!("Connect with: ssh {session_id}@{relay}");
+    } else {
+        println!("Connect with: ssh {session_id}@localhost -p {port}");
+    }
     println!("Working directory: {}", cwd.display());
+
+    // Connect to relay if specified
+    if let Some(relay) = relay_host {
+        let relay_addr = if relay.contains(':') {
+            relay.to_string()
+        } else {
+            format!("{relay}:22")
+        };
+        let session_id_clone = session_id.clone();
+        let state_clone = state.clone();
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = connect_to_relay(&relay_addr, &session_id_clone, state_clone, tx_clone).await {
+                eprintln!("[romoto] relay connection failed: {e}");
+            }
+        });
+    }
 
     let mut server = AppServer {
         state: state.clone(),
@@ -331,4 +353,135 @@ impl Handler for ClientHandler {
         let _ = state.pty_writer.flush();
         Ok(())
     }
+}
+
+// --- Relay client ---
+
+async fn connect_to_relay(
+    relay_addr: &str,
+    session_id: &str,
+    state: Arc<Mutex<SharedState>>,
+    broadcast_tx: broadcast::Sender<Vec<u8>>,
+) -> Result<()> {
+    let config = Arc::new(russh::client::Config::default());
+    let handler = RelayClientHandler {
+        state,
+        broadcast_tx,
+    };
+
+    let mut session = russh::client::connect(config, relay_addr, handler).await?;
+    let auth_result = session.authenticate_none(format!("host:{session_id}")).await?;
+    if !auth_result {
+        anyhow::bail!("relay auth rejected");
+    }
+
+    eprintln!("[romoto] connected to relay");
+
+    // Open a session channel to register with the relay
+    let channel = session.channel_open_session().await?;
+    channel.request_shell(false).await?;
+
+    // Keep the connection alive — the relay will open forwarded channels for guests
+    // The client handler's server_channel_open_forwarded_tcpip handles incoming guests
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+struct RelayClientHandler {
+    state: Arc<Mutex<SharedState>>,
+    broadcast_tx: broadcast::Sender<Vec<u8>>,
+}
+
+#[async_trait]
+impl russh::client::Handler for RelayClientHandler {
+    type Error = anyhow::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<russh::client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        eprintln!("[romoto] guest connected via relay");
+
+        let stream = channel.into_stream();
+        let (mut read_half, mut write_half) = tokio::io::split(stream);
+        let state = self.state.clone();
+        let mut rx = self.broadcast_tx.subscribe();
+
+        // Forward PTY broadcast → guest (via relay channel)
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // Send current buffer first
+            {
+                let s = state_clone.lock().await;
+                if !s.buffer.is_empty() {
+                    if write_half.write_all(&s.buffer).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            // Then forward broadcast
+            while let Ok(data) = rx.recv().await {
+                if write_half.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Forward guest input → PTY
+        let state2 = self.state.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match read_half.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = &buf[..n];
+                        if let Some(resize) = parse_resize_escape(data) {
+                            let mut s = state2.lock().await;
+                            let size = PtySize {
+                                rows: resize.1,
+                                cols: resize.0,
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            };
+                            let _ = s.pty_master.resize(size);
+                            s.last_size = size;
+                        } else {
+                            let mut s = state2.lock().await;
+                            let _ = s.pty_writer.write_all(data);
+                            let _ = s.pty_writer.flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            eprintln!("[romoto] guest disconnected from relay");
+        });
+
+        Ok(())
+    }
+}
+
+fn parse_resize_escape(data: &[u8]) -> Option<(u16, u16)> {
+    let s = std::str::from_utf8(data).ok()?;
+    let s = s.strip_prefix("\x1b]romoto;resize;")?;
+    let s = s.strip_suffix('\x07')?;
+    let mut parts = s.split(';');
+    let cols: u16 = parts.next()?.parse().ok()?;
+    let rows: u16 = parts.next()?.parse().ok()?;
+    Some((cols, rows))
 }
