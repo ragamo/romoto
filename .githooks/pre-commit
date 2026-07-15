@@ -1,0 +1,2 @@
+#!/bin/sh
+cargo test --quiet 2>&1

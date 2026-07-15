@@ -330,3 +330,86 @@ impl RelayHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_handler(pass: Option<&str>) -> RelayHandler {
+        RelayHandler {
+            peer_addr: "127.0.0.1:1234".into(),
+            state: Arc::new(Mutex::new(RelayState { hosts: HashMap::new() })),
+            pass: pass.map(|s| Arc::new(s.to_string())),
+            role: ConnectionRole::Unknown,
+            session_id: None,
+            host_channel_info: None,
+        }
+    }
+
+    #[test]
+    fn test_classify_user_host() {
+        let mut h = make_handler(None);
+        h.classify_user("host:abc123");
+        assert!(matches!(h.role, ConnectionRole::Host));
+        assert_eq!(h.session_id.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_classify_user_guest() {
+        let mut h = make_handler(None);
+        h.classify_user("abc123");
+        assert!(matches!(h.role, ConnectionRole::Guest));
+        assert_eq!(h.session_id.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_classify_user_host_empty_sid() {
+        let mut h = make_handler(None);
+        h.classify_user("host:");
+        assert!(matches!(h.role, ConnectionRole::Host));
+        assert_eq!(h.session_id.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_classify_user_not_host_prefix() {
+        let mut h = make_handler(None);
+        h.classify_user("hosting");
+        assert!(matches!(h.role, ConnectionRole::Guest));
+        assert_eq!(h.session_id.as_deref(), Some("hosting"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_none_host_no_pass() {
+        let mut h = make_handler(None);
+        let result = h.auth_none("host:session1").await.unwrap();
+        assert!(matches!(result, Auth::Accept));
+    }
+
+    #[tokio::test]
+    async fn test_auth_none_host_with_pass_rejects() {
+        let mut h = make_handler(Some("secret"));
+        let result = h.auth_none("host:session1").await.unwrap();
+        assert!(matches!(result, Auth::Reject { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_auth_password_host_correct() {
+        let mut h = make_handler(Some("secret"));
+        let result = h.auth_password("host:session1", "secret").await.unwrap();
+        assert!(matches!(result, Auth::Accept));
+    }
+
+    #[tokio::test]
+    async fn test_auth_password_host_wrong() {
+        let mut h = make_handler(Some("secret"));
+        let result = h.auth_password("host:session1", "wrong").await.unwrap();
+        assert!(matches!(result, Auth::Reject { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_auth_guest_no_host_registered() {
+        let mut h = make_handler(None);
+        let result = h.auth_none("session1").await.unwrap();
+        assert!(matches!(result, Auth::Reject { .. }));
+    }
+}

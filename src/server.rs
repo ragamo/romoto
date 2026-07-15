@@ -497,3 +497,63 @@ fn parse_resize_escape(data: &[u8]) -> Option<(u16, u16)> {
     let rows: u16 = parts.next()?.parse().ok()?;
     Some((cols, rows))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_session_id_length() {
+        let id = generate_session_id();
+        assert_eq!(id.len(), 8);
+    }
+
+    #[test]
+    fn test_generate_session_id_charset() {
+        let id = generate_session_id();
+        assert!(id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn test_generate_session_id_unique() {
+        let a = generate_session_id();
+        let b = generate_session_id();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_parse_resize_escape_valid() {
+        let data = b"\x1b]romoto;resize;120;40\x07";
+        assert_eq!(parse_resize_escape(data), Some((120, 40)));
+    }
+
+    #[test]
+    fn test_parse_resize_escape_small() {
+        let data = b"\x1b]romoto;resize;80;24\x07";
+        assert_eq!(parse_resize_escape(data), Some((80, 24)));
+    }
+
+    #[test]
+    fn test_parse_resize_escape_invalid_prefix() {
+        let data = b"\x1b[romoto;resize;80;24\x07";
+        assert_eq!(parse_resize_escape(data), None);
+    }
+
+    #[test]
+    fn test_parse_resize_escape_no_suffix() {
+        let data = b"\x1b]romoto;resize;80;24";
+        assert_eq!(parse_resize_escape(data), None);
+    }
+
+    #[test]
+    fn test_parse_resize_escape_not_numbers() {
+        let data = b"\x1b]romoto;resize;abc;def\x07";
+        assert_eq!(parse_resize_escape(data), None);
+    }
+
+    #[test]
+    fn test_parse_resize_escape_random_data() {
+        let data = b"hello world";
+        assert_eq!(parse_resize_escape(data), None);
+    }
+}
