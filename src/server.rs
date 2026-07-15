@@ -8,22 +8,21 @@ use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use rand::Rng;
 use russh::server::{Auth, Handler, Msg, Server, Session};
 use russh::{Channel, ChannelId, CryptoVec, Pty};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, Notify};
 
 struct SharedState {
     pty_master: Box<dyn portable_pty::MasterPty + Send>,
+    pty_writer: Box<dyn Write + Send>,
     buffer: Vec<u8>,
+    last_size: PtySize,
 }
 
-pub fn run(cmd_name: &str) -> Result<()> {
+pub fn run(cmd_name: &str, port: u16) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(cmd_name))
+    rt.block_on(run_async(cmd_name, port))
 }
 
-async fn run_async(cmd_name: &str) -> Result<()> {
-    let session_id = generate_session_id();
-    let cwd = std::env::current_dir()?;
-
+fn spawn_pty(cmd_name: &str, cwd: &std::path::Path) -> Result<(Box<dyn portable_pty::MasterPty + Send>, Box<dyn Write + Send>, Box<dyn Read + Send>)> {
     let pty_system = NativePtySystem::default();
     let pty_pair = pty_system.openpty(PtySize {
         rows: 24,
@@ -33,45 +32,72 @@ async fn run_async(cmd_name: &str) -> Result<()> {
     })?;
 
     let mut cmd = CommandBuilder::new(cmd_name);
-    cmd.cwd(&cwd);
+    cmd.cwd(cwd);
 
     let _child = pty_pair.slave.spawn_command(cmd)?;
     drop(pty_pair.slave);
 
-    let pty_writer = Arc::new(std::sync::Mutex::new(pty_pair.master.take_writer()?));
-    let mut reader = pty_pair.master.try_clone_reader()?;
+    let writer = pty_pair.master.take_writer()?;
+    let reader = pty_pair.master.try_clone_reader()?;
+
+    Ok((pty_pair.master, writer, reader))
+}
+
+async fn run_async(cmd_name: &str, port: u16) -> Result<()> {
+    let session_id = generate_session_id();
+    let cwd = std::env::current_dir()?;
+
+    let (master, writer, reader) = spawn_pty(cmd_name, &cwd)?;
 
     let state = Arc::new(Mutex::new(SharedState {
-        pty_master: pty_pair.master,
+        pty_master: master,
+        pty_writer: writer,
         buffer: Vec::new(),
+        last_size: PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
     }));
 
-    // Broadcast channel for PTY output
     let (tx, _) = broadcast::channel::<Vec<u8>>(256);
-    let tx_clone = tx.clone();
+    let respawn_notify = Arc::new(Notify::new());
 
-    // Read PTY in a blocking thread, send to broadcast channel
+    // Start the PTY reader loop
+    start_reader(reader, state.clone(), tx.clone(), respawn_notify.clone());
+
+    // Respawn loop: when the process exits, restart it
     let state_clone = state.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; 8192];
+    let tx_clone = tx.clone();
+    let respawn_notify_clone = respawn_notify.clone();
+    let cmd_owned = cmd_name.to_string();
+    let cwd_clone = cwd.clone();
+    tokio::spawn(async move {
         loop {
-            let n = match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            let data = buf[..n].to_vec();
+            respawn_notify_clone.notified().await;
+            eprintln!("[romoto] process exited, restarting...");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            // Update replay buffer (best-effort, non-blocking)
-            if let Ok(mut s) = state_clone.try_lock() {
-                s.buffer.extend_from_slice(&data);
-                if s.buffer.len() > 65536 {
-                    let drain = s.buffer.len() - 65536;
-                    s.buffer.drain(..drain);
+            match spawn_pty(&cmd_owned, &cwd_clone) {
+                Ok((master, writer, reader)) => {
+                    let size;
+                    {
+                        let mut s = state_clone.lock().await;
+                        size = s.last_size;
+                        s.pty_master = master;
+                        s.pty_writer = writer;
+                        s.buffer.clear();
+                    }
+                    // Resize new PTY to match last known client size
+                    {
+                        let s = state_clone.lock().await;
+                        let _ = s.pty_master.resize(size);
+                    }
+                    // Clear connected clients' screens
+                    let _ = tx_clone.send(b"\x1b[2J\x1b[H".to_vec());
+                    start_reader(reader, state_clone.clone(), tx_clone.clone(), respawn_notify_clone.clone());
+                    eprintln!("[romoto] process restarted");
+                }
+                Err(e) => {
+                    eprintln!("[romoto] failed to restart process: {e}");
                 }
             }
-
-            let _ = tx_clone.send(data);
         }
     });
 
@@ -84,7 +110,6 @@ async fn run_async(cmd_name: &str) -> Result<()> {
         ..Default::default()
     };
 
-    let port = 2222;
     println!("\x1b[1mromoto\x1b[0m session started");
     println!("Command: {cmd_name}");
     println!("Connect with: ssh {session_id}@localhost -p {port}");
@@ -92,7 +117,6 @@ async fn run_async(cmd_name: &str) -> Result<()> {
 
     let mut server = AppServer {
         state: state.clone(),
-        pty_writer: pty_writer.clone(),
         broadcast_tx: tx,
         session_id: session_id.clone(),
     };
@@ -102,6 +126,36 @@ async fn run_async(cmd_name: &str) -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+fn start_reader(
+    mut reader: Box<dyn Read + Send>,
+    state: Arc<Mutex<SharedState>>,
+    tx: broadcast::Sender<Vec<u8>>,
+    respawn_notify: Arc<Notify>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let data = buf[..n].to_vec();
+
+            if let Ok(mut s) = state.try_lock() {
+                s.buffer.extend_from_slice(&data);
+                if s.buffer.len() > 65536 {
+                    let drain = s.buffer.len() - 65536;
+                    s.buffer.drain(..drain);
+                }
+            }
+
+            let _ = tx.send(data);
+        }
+        respawn_notify.notify_one();
+    });
 }
 
 fn generate_session_id() -> String {
@@ -115,7 +169,6 @@ fn generate_session_id() -> String {
 #[derive(Clone)]
 struct AppServer {
     state: Arc<Mutex<SharedState>>,
-    pty_writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     session_id: String,
 }
@@ -129,7 +182,6 @@ impl Server for AppServer {
         ClientHandler {
             peer_addr,
             state: self.state.clone(),
-            pty_writer: self.pty_writer.clone(),
             broadcast_tx: self.broadcast_tx.clone(),
             session_id: self.session_id.clone(),
         }
@@ -139,7 +191,6 @@ impl Server for AppServer {
 struct ClientHandler {
     peer_addr: String,
     state: Arc<Mutex<SharedState>>,
-    pty_writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     session_id: String,
 }
@@ -201,13 +252,15 @@ impl Handler for ClientHandler {
         _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let state = self.state.lock().await;
-        state.pty_master.resize(PtySize {
+        let size = PtySize {
             rows: row_height as u16,
             cols: col_width as u16,
             pixel_width: 0,
             pixel_height: 0,
-        })?;
+        };
+        let mut state = self.state.lock().await;
+        state.pty_master.resize(size)?;
+        state.last_size = size;
         session.channel_success(channel);
         Ok(())
     }
@@ -255,13 +308,15 @@ impl Handler for ClientHandler {
         _pix_height: u32,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let state = self.state.lock().await;
-        state.pty_master.resize(PtySize {
+        let size = PtySize {
             rows: row_height as u16,
             cols: col_width as u16,
             pixel_width: 0,
             pixel_height: 0,
-        })?;
+        };
+        let mut state = self.state.lock().await;
+        state.pty_master.resize(size)?;
+        state.last_size = size;
         Ok(())
     }
 
@@ -271,10 +326,9 @@ impl Handler for ClientHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Ok(mut writer) = self.pty_writer.lock() {
-            let _ = writer.write_all(data);
-            let _ = writer.flush();
-        }
+        let mut state = self.state.lock().await;
+        let _ = state.pty_writer.write_all(data);
+        let _ = state.pty_writer.flush();
         Ok(())
     }
 }
