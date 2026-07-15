@@ -16,12 +16,13 @@ struct RelayState {
     hosts: HashMap<String, HostEntry>,
 }
 
-pub fn run(port: u16) -> Result<()> {
+pub fn run(port: u16, pass: Option<&str>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(port))
+    let pass_owned = pass.map(|s| s.to_string());
+    rt.block_on(run_async(port, pass_owned))
 }
 
-async fn run_async(port: u16) -> Result<()> {
+async fn run_async(port: u16, pass: Option<String>) -> Result<()> {
     let state = Arc::new(Mutex::new(RelayState {
         hosts: HashMap::new(),
     }));
@@ -36,9 +37,17 @@ async fn run_async(port: u16) -> Result<()> {
     };
 
     println!("\x1b[1mromoto relay\x1b[0m listening on port {port}");
+    if pass.is_some() {
+        eprintln!("[relay] password protection enabled");
+    } else {
+        eprintln!("[relay] no password set — any host can register (use --pass to secure)");
+    }
+
+    let pass = pass.map(Arc::new);
 
     let mut server = RelayServer {
         state,
+        pass,
     };
 
     server
@@ -53,6 +62,7 @@ async fn run_async(port: u16) -> Result<()> {
 #[derive(Clone)]
 struct RelayServer {
     state: Arc<Mutex<RelayState>>,
+    pass: Option<Arc<String>>,
 }
 
 impl Server for RelayServer {
@@ -64,6 +74,7 @@ impl Server for RelayServer {
         RelayHandler {
             peer_addr,
             state: self.state.clone(),
+            pass: self.pass.clone(),
             role: ConnectionRole::Unknown,
             session_id: None,
             host_channel_info: None,
@@ -81,6 +92,7 @@ enum ConnectionRole {
 struct RelayHandler {
     peer_addr: String,
     state: Arc<Mutex<RelayState>>,
+    pass: Option<Arc<String>>,
     role: ConnectionRole,
     session_id: Option<String>,
     host_channel_info: Option<(russh::server::Handle, ChannelId)>,
@@ -94,8 +106,14 @@ impl Handler for RelayHandler {
         self.classify_user(user);
         match self.role {
             ConnectionRole::Host => {
-                eprintln!("[relay] host registered: session={} from {}", self.session_id.as_deref().unwrap_or("?"), self.peer_addr);
-                Ok(Auth::Accept)
+                if self.pass.is_some() {
+                    // Require password auth for hosts when pass is set
+                    eprintln!("[relay] host requires password: session={} from {}", self.session_id.as_deref().unwrap_or("?"), self.peer_addr);
+                    Ok(Auth::Reject { proceed_with_methods: None })
+                } else {
+                    eprintln!("[relay] host registered: session={} from {}", self.session_id.as_deref().unwrap_or("?"), self.peer_addr);
+                    Ok(Auth::Accept)
+                }
             }
             ConnectionRole::Guest => {
                 let sid = self.session_id.as_deref().unwrap_or("");
@@ -112,8 +130,36 @@ impl Handler for RelayHandler {
         }
     }
 
-    async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
-        self.auth_none(user).await
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        self.classify_user(user);
+        match self.role {
+            ConnectionRole::Host => {
+                if let Some(ref expected) = self.pass {
+                    if password == expected.as_str() {
+                        eprintln!("[relay] host registered: session={} from {}", self.session_id.as_deref().unwrap_or("?"), self.peer_addr);
+                        Ok(Auth::Accept)
+                    } else {
+                        eprintln!("[relay] host rejected (bad password): from {}", self.peer_addr);
+                        Ok(Auth::Reject { proceed_with_methods: None })
+                    }
+                } else {
+                    eprintln!("[relay] host registered: session={} from {}", self.session_id.as_deref().unwrap_or("?"), self.peer_addr);
+                    Ok(Auth::Accept)
+                }
+            }
+            ConnectionRole::Guest => {
+                let sid = self.session_id.as_deref().unwrap_or("");
+                let state = self.state.lock().await;
+                if state.hosts.contains_key(sid) {
+                    eprintln!("[relay] guest accepted: session={sid} from {}", self.peer_addr);
+                    Ok(Auth::Accept)
+                } else {
+                    eprintln!("[relay] guest rejected (no host): session={sid} from {}", self.peer_addr);
+                    Ok(Auth::Reject { proceed_with_methods: None })
+                }
+            }
+            _ => Ok(Auth::Reject { proceed_with_methods: None }),
+        }
     }
 
     async fn auth_publickey(
@@ -121,7 +167,17 @@ impl Handler for RelayHandler {
         user: &str,
         _key: &russh::keys::key::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        self.auth_none(user).await
+        self.classify_user(user);
+        // Guests can auth with publickey (no password needed)
+        if matches!(self.role, ConnectionRole::Guest) {
+            let sid = self.session_id.as_deref().unwrap_or("");
+            let state = self.state.lock().await;
+            if state.hosts.contains_key(sid) {
+                eprintln!("[relay] guest accepted (publickey): session={sid} from {}", self.peer_addr);
+                return Ok(Auth::Accept);
+            }
+        }
+        Ok(Auth::Reject { proceed_with_methods: None })
     }
 
     async fn channel_open_session(

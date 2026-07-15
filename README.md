@@ -60,6 +60,7 @@ The session ID (`abc12345`) acts as both the username and access token. Multiple
 |------|-------------|
 | `-p, --port <n>` | SSH port (default: 2222) |
 | `--relay <host>` | Connect to a relay server |
+| `--pass <token>` | Password for relay authentication |
 | `-v, --version` | Show version |
 | `-h, --help` | Show help |
 
@@ -79,13 +80,15 @@ The session ID (`abc12345`) acts as both the username and access token. Multiple
 
 ```bash
 # On your VPS (e.g. romoto.yourdomain.com)
-romoto relay -p 2222
+romoto relay -p 2222 --pass mysecret
 ```
+
+Use `--pass` to require a password for host registration. Without it, any host can register — the relay will warn you on startup.
 
 ### Host (your machine)
 
 ```bash
-romoto claude --relay romoto.yourdomain.com:2222
+romoto claude --relay romoto.yourdomain.com:2222 --pass mysecret
 ```
 
 `romoto` connects to the relay, registers its session, and prints:
@@ -103,7 +106,7 @@ Connect with: ssh abc12345@romoto.yourdomain.com -p 2222
 ssh abc12345@romoto.yourdomain.com -p 2222
 ```
 
-The relay looks up the session ID and routes the connection to the correct host. Multiple hosts can share a single relay — each gets its own session ID.
+The guest doesn't need `--pass` — only the session ID. The password is only between host and relay to prevent unauthorized host registration.
 
 ## Sharing remotely (without relay)
 

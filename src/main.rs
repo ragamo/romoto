@@ -24,6 +24,7 @@ fn main() -> Result<()> {
         println!("Options:");
         println!("  -p, --port <n>     SSH port to listen on (default: 2222)");
         println!("  --relay <host>     Connect to a relay server");
+        println!("  --pass <token>     Password for relay auth");
         println!("  -v, --version      Show version");
         println!("  -h, --help         Show this help");
         return Ok(());
@@ -38,6 +39,9 @@ fn main() -> Result<()> {
     let relay_pos = args.iter().position(|a| a == "--relay");
     let relay_host = relay_pos.and_then(|i| args.get(i + 1)).map(|s| s.as_str());
 
+    let pass_pos = args.iter().position(|a| a == "--pass");
+    let pass = pass_pos.and_then(|i| args.get(i + 1)).map(|s| s.as_str());
+
     let cmd = args.iter()
         .enumerate()
         .skip(1)
@@ -45,11 +49,12 @@ fn main() -> Result<()> {
             !a.starts_with('-')
                 && port_pos.map_or(true, |p| *i != p + 1)
                 && relay_pos.map_or(true, |r| *i != r + 1)
+                && pass_pos.map_or(true, |p| *i != p + 1)
         })
         .map(|(_, s)| s.as_str());
 
     if cmd == Some("relay") {
-        return relay::run(port);
+        return relay::run(port, pass);
     }
 
     let Some(cmd) = cmd else {
@@ -59,5 +64,5 @@ fn main() -> Result<()> {
         std::process::exit(1);
     };
 
-    server::run(cmd, port, relay_host)
+    server::run(cmd, port, relay_host, pass)
 }

@@ -17,9 +17,9 @@ struct SharedState {
     last_size: PtySize,
 }
 
-pub fn run(cmd_name: &str, port: u16, relay_host: Option<&str>) -> Result<()> {
+pub fn run(cmd_name: &str, port: u16, relay_host: Option<&str>, relay_pass: Option<&str>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(cmd_name, port, relay_host))
+    rt.block_on(run_async(cmd_name, port, relay_host, relay_pass))
 }
 
 fn spawn_pty(cmd_name: &str, cwd: &std::path::Path) -> Result<(Box<dyn portable_pty::MasterPty + Send>, Box<dyn Write + Send>, Box<dyn Read + Send>)> {
@@ -43,7 +43,7 @@ fn spawn_pty(cmd_name: &str, cwd: &std::path::Path) -> Result<(Box<dyn portable_
     Ok((pty_pair.master, writer, reader))
 }
 
-async fn run_async(cmd_name: &str, port: u16, relay_host: Option<&str>) -> Result<()> {
+async fn run_async(cmd_name: &str, port: u16, relay_host: Option<&str>, relay_pass: Option<&str>) -> Result<()> {
     let session_id = generate_session_id();
     let cwd = std::env::current_dir()?;
 
@@ -130,8 +130,14 @@ async fn run_async(cmd_name: &str, port: u16, relay_host: Option<&str>) -> Resul
         let session_id_clone = session_id.clone();
         let state_clone = state.clone();
         let tx_clone = tx.clone();
+        let pass_owned = relay_pass.map(|s| s.to_string());
+        if pass_owned.is_some() {
+            eprintln!("[romoto] relay password set");
+        } else {
+            eprintln!("[romoto] no relay password");
+        }
         tokio::spawn(async move {
-            if let Err(e) = connect_to_relay(&relay_addr, &session_id_clone, state_clone, tx_clone).await {
+            if let Err(e) = connect_to_relay(&relay_addr, &session_id_clone, pass_owned.as_deref(), state_clone, tx_clone).await {
                 eprintln!("[romoto] relay connection failed: {e}");
             }
         });
@@ -360,6 +366,7 @@ impl Handler for ClientHandler {
 async fn connect_to_relay(
     relay_addr: &str,
     session_id: &str,
+    pass: Option<&str>,
     state: Arc<Mutex<SharedState>>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
 ) -> Result<()> {
@@ -370,9 +377,14 @@ async fn connect_to_relay(
     };
 
     let mut session = russh::client::connect(config, relay_addr, handler).await?;
-    let auth_result = session.authenticate_none(format!("host:{session_id}")).await?;
+    let user = format!("host:{session_id}");
+    let auth_result = if let Some(password) = pass {
+        session.authenticate_password(&user, password).await?
+    } else {
+        session.authenticate_none(&user).await?
+    };
     if !auth_result {
-        anyhow::bail!("relay auth rejected");
+        anyhow::bail!("relay auth rejected — check --pass");
     }
 
     eprintln!("[romoto] connected to relay");
