@@ -4,6 +4,14 @@ Share a terminal session over SSH. Run any CLI tool and let others join via SSH 
 
 ## Install
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew install ragamo/tap/romoto
+```
+
+### From source
+
 ```bash
 cargo install --path .
 ```
