@@ -50,9 +50,14 @@ async fn run_async(port: u16, pass: Option<String>) -> Result<()> {
         pass,
     };
 
-    server
-        .run_on_address(Arc::new(config), ("0.0.0.0", port))
-        .await?;
+    tokio::select! {
+        result = server.run_on_address(Arc::new(config), ("0.0.0.0", port)) => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("\n[relay] shutting down");
+        }
+    }
 
     Ok(())
 }

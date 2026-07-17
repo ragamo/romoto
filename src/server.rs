@@ -149,9 +149,14 @@ async fn run_async(cmd_name: &str, port: u16, relay_host: Option<&str>, relay_pa
         session_id: session_id.clone(),
     };
 
-    server
-        .run_on_address(Arc::new(config), ("0.0.0.0", port))
-        .await?;
+    tokio::select! {
+        result = server.run_on_address(Arc::new(config), ("0.0.0.0", port)) => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("\n[romoto] shutting down");
+        }
+    }
 
     Ok(())
 }
