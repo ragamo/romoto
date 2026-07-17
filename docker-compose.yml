@@ -1,6 +1,9 @@
 services:
   relay:
-    build: .
+    build:
+      context: .
+      args:
+        VERSION: ${ROMOTO_VERSION:-0.2.0}
     command: ["relay", "-p", "2222", "--pass", "${ROMOTO_PASS:-changeme}"]
     ports:
       - "2222:2222"
