@@ -21,8 +21,8 @@ sha() {
 
 MAC_ARM="$(sha aarch64-apple-darwin)"
 MAC_X86="$(sha x86_64-apple-darwin)"
-LIN_ARM="$(sha aarch64-unknown-linux-gnu)"
-LIN_X86="$(sha x86_64-unknown-linux-gnu)"
+LIN_ARM="$(sha aarch64-unknown-linux-musl)"
+LIN_X86="$(sha x86_64-unknown-linux-musl)"
 
 cat <<EOF
 class Romoto < Formula
@@ -44,11 +44,11 @@ class Romoto < Formula
 
   on_linux do
     on_arm do
-      url "$base/romoto-aarch64-unknown-linux-gnu.tar.gz"
+      url "$base/romoto-aarch64-unknown-linux-musl.tar.gz"
       sha256 "$LIN_ARM"
     end
     on_intel do
-      url "$base/romoto-x86_64-unknown-linux-gnu.tar.gz"
+      url "$base/romoto-x86_64-unknown-linux-musl.tar.gz"
       sha256 "$LIN_X86"
     end
   end
