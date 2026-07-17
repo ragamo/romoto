@@ -113,8 +113,17 @@ async fn run_async(cmd_name: &str, port: u16, relay_host: Option<&str>, relay_pa
     println!("\x1b[1mromoto\x1b[0m session started");
     println!("Command: {cmd_name}");
     if let Some(relay) = relay_host {
+        let (relay_host_part, relay_port) = if let Some((h, p)) = relay.rsplit_once(':') {
+            (h, p)
+        } else {
+            (relay, "22")
+        };
         println!("Relay: {relay}");
-        println!("Connect with: ssh {session_id}@{relay}");
+        if relay_port == "22" {
+            println!("Connect with: ssh {session_id}@{relay_host_part}");
+        } else {
+            println!("Connect with: ssh {session_id}@{relay_host_part} -p {relay_port}");
+        }
     } else {
         println!("Connect with: ssh {session_id}@localhost -p {port}");
     }
