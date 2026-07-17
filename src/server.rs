@@ -164,6 +164,7 @@ async fn run_async(cmd_name: &str, port: u16, relay_host: Option<&str>, relay_pa
         }
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n[romoto] shutting down");
+            std::process::exit(0);
         }
     }
 

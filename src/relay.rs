@@ -56,6 +56,7 @@ async fn run_async(port: u16, pass: Option<String>) -> Result<()> {
         }
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n[relay] shutting down");
+            std::process::exit(0);
         }
     }
 
