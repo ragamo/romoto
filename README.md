@@ -80,6 +80,9 @@ The session ID (`abc12345`) acts as both the username and access token. Multiple
 
 ```bash
 # On your VPS (e.g. romoto.yourdomain.com)
+romoto relay --pass mysecret
+
+# Or with a specific port
 romoto relay -p 2222 --pass mysecret
 ```
 
